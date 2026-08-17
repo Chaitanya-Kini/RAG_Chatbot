@@ -1,0 +1,14 @@
+[theme]
+base = "light"
+primaryColor = "#4f46e5"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f7f8fc"
+textColor = "#1f2430"
+
+[browser]
+gatherUsageStats = false
+
+[server]
+# Skip the first-run "enter your email" prompt, which blocks any start that has no
+# terminal attached (app.sh uses nohup). Also stops a browser tab auto-opening.
+headless = true

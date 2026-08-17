@@ -1,5 +1,5 @@
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from rank_bm25 import BM25Okapi
 
@@ -26,16 +26,30 @@ SPARSE_CANDIDATE_FACTOR = 4
 def _hit_key(hit: Dict[str, Any]) -> str:
     """Stable identity for a chunk, used to merge dense and sparse hits.
 
-    Prefer the indexer's (source, chunk_index) pair; fall back to the chunk text
-    when metadata is missing. Keying on str(metadata) would be fragile, since it
-    depends on dict ordering.
+    Prefer the indexer's (project, source, chunk_index) triple; fall back to the
+    chunk text when metadata is missing. Keying on str(metadata) would be fragile,
+    since it depends on dict ordering.
     """
     metadata = hit.get("metadata") or {}
+    project = metadata.get("project")
     source = metadata.get("source")
     chunk_index = metadata.get("chunk_index")
     if source is not None and chunk_index is not None:
-        return f"{source}#{chunk_index}"
+        return f"{project}#{source}#{chunk_index}"
     return hit["text"]
+
+
+class _ProjectIndex:
+    """One project's corpus plus its BM25 index."""
+
+    def __init__(self, documents: List[str], metadatas: List[Dict[str, Any]]):
+        self.documents = documents
+        self.metadatas = metadatas
+        self.bm25 = (
+            BM25Okapi([re.findall(r"\w+", doc.lower()) for doc in documents])
+            if documents
+            else None
+        )
 
 
 class HybridRetriever:
@@ -54,52 +68,74 @@ class HybridRetriever:
             if self.client is not None
             else None
         )
-        self.documents: List[str] = []
-        self.metadatas: List[Dict[str, Any]] = []
-        self.bm25 = None
-        # Chunk count the in-memory BM25 index was last built from. None forces a
-        # build on first use.
-        self._indexed_count: int | None = None
+        # BM25 is per project: scoring depends on corpus-wide term statistics, so a
+        # single index built over every project would let one project's vocabulary
+        # skew another's IDF values.
+        self._indexes: Dict[str, _ProjectIndex] = {}
+        # Chunk count the cached indexes were built from. None forces a rebuild.
+        self._indexed_count: Optional[int] = None
 
-    def _load_index_state(self) -> None:
-        """Reload the corpus from Chroma and rebuild the BM25 index unconditionally."""
-        if self.collection is None:
-            return
-        collection_data = self.collection.get(include=["documents", "metadatas"])
-        self.documents = collection_data.get("documents", [])
-        self.metadatas = collection_data.get("metadatas", [])
-        self._indexed_count = len(self.documents)
-        if not self.documents:
-            self.bm25 = None
-            return
-        tokenized_docs = [re.findall(r"\w+", doc.lower()) for doc in self.documents]
-        self.bm25 = BM25Okapi(tokenized_docs)
+    def refresh(self) -> None:
+        """Drop the cached per-project indexes so the next query rebuilds them.
 
-    def _ensure_index_state(self) -> None:
-        """Rebuild the BM25 index only when the collection size changed.
+        Callers that mutate the collection (ingest, delete) must call this: the
+        cheap count() check below cannot notice a delete and an add that happen to
+        cancel out.
+        """
+        self._indexes = {}
+        self._indexed_count = None
 
-        Reading the whole collection and rebuilding BM25 costs O(corpus), so doing it
-        per query would make every request scale with the total document count.
-        collection.count() is a cheap COUNT query, which keeps the common path O(1).
-        Callers that mutate the collection should invoke _load_index_state() directly
-        to force a rebuild.
+    # Kept for backwards compatibility with the pre-projects call sites.
+    _load_index_state = refresh
+
+    def _project_index(self, project: str) -> Optional[_ProjectIndex]:
+        """Cached corpus for one project, rebuilt when the collection changes.
+
+        Reading a corpus and building BM25 costs O(project), so doing it per query
+        would make every request scale with the document count. collection.count()
+        is a cheap COUNT query, which keeps the common path O(1).
         """
         if self.collection is None:
-            return
-        if self._indexed_count != self.collection.count():
-            self._load_index_state()
+            return None
 
-    def retrieve(self, query: str, top_k: int = MAX_CONTEXT_CHUNKS) -> List[Dict[str, Any]]:
-        if self.collection is None:
+        total = self.collection.count()
+        if self._indexed_count != total:
+            self._indexes = {}
+            self._indexed_count = total
+
+        index = self._indexes.get(project)
+        if index is None:
+            data = self.collection.get(
+                where={"project": project},
+                include=["documents", "metadatas"],
+            )
+            index = _ProjectIndex(
+                documents=data.get("documents") or [],
+                metadatas=data.get("metadatas") or [],
+            )
+            self._indexes[project] = index
+        return index
+
+    def retrieve(
+        self,
+        query: str,
+        project: str,
+        top_k: int = MAX_CONTEXT_CHUNKS,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve the best chunks for a query, restricted to one project."""
+        if self.collection is None or not project:
             return []
 
-        self._ensure_index_state()
-        if not self.documents:
+        index = self._project_index(project)
+        if index is None or not index.documents:
             return []
 
         dense_results = self.collection.query(
             query_texts=[query],
             n_results=top_k,
+            # Scope the vector search to this project, so documents from other
+            # projects can never enter the answer's context.
+            where={"project": project},
             include=["documents", "metadatas", "distances"],
         )
 
@@ -111,7 +147,6 @@ class HybridRetriever:
             # Chroma's default space is squared L2. The embedding function returns
             # unit-normalised vectors, so squared L2 and cosine relate exactly as
             # d = 2 * (1 - cos), giving cos = 1 - d / 2 over the range [-1, 1].
-            # The previous "1 - d" assumed cosine distance and clamped most hits to 0.
             score = 1.0 - float(distance) / 2.0 if distance is not None else 0.0
             dense_hits.append({
                 "text": document,
@@ -120,16 +155,16 @@ class HybridRetriever:
             })
 
         sparse_hits: List[Dict[str, Any]] = []
-        if self.bm25 is not None:
+        if index.bm25 is not None:
             query_tokens = re.findall(r"\w+", query.lower())
-            scores = self.bm25.get_scores(query_tokens)
+            scores = index.bm25.get_scores(query_tokens)
             # Keep every candidate rather than dropping score <= 0. BM25 assigns
             # negative IDF to terms that appear in most documents, so on a small
             # corpus filtering by score would discard the entire sparse signal.
-            for index, score in enumerate(scores):
+            for position, score in enumerate(scores):
                 sparse_hits.append({
-                    "text": self.documents[index],
-                    "metadata": self.metadatas[index] if index < len(self.metadatas) else {},
+                    "text": index.documents[position],
+                    "metadata": index.metadatas[position] if position < len(index.metadatas) else {},
                     "score": float(score),
                 })
             sparse_hits.sort(key=lambda item: item["score"], reverse=True)
@@ -163,5 +198,5 @@ class HybridRetriever:
 
 if __name__ == "__main__":
     retriever = HybridRetriever()
-    retriever._load_index_state()
+    retriever.refresh()
     print("Retriever initialized")

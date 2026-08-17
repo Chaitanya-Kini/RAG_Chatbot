@@ -5,6 +5,7 @@ __pycache__/
 backend/chroma_db/*
 !backend/chroma_db/.gitkeep
 backend/data/*.pdf
+backend/data/**/*.pdf
 !backend/data/.gitkeep
 .DS_Store
 logs/

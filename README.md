@@ -2,14 +2,21 @@
 
 This project is a RAG (Retrieval-Augmented Generation) chatbot that allows users to upload their own PDF documents and ask questions about them. The chatbot retrieves relevant chunks from the documents and uses a local LLM to generate answers grounded in the provided context.
 
+Documents are organised into **projects**. Each project is an isolated knowledge
+base: a chat answers from the selected project's documents only, and never from
+any other project's. With no project selected, the chat falls back to general
+chat and answers from the model's own knowledge instead.
+
 ## Features
 
-- PDF upload and ingestion from the UI
+- Two-page UI: **Chat** and **Projects**
+- Projects as isolated knowledge bases, created from the UI
+- General chat when no project is selected: answers come from the model alone
+- Per-project PDF upload, with ingest and delete per document
 - Document chunking with metadata preservation
-- Hybrid retrieval using ChromaDB (vector search) + BM25 (keyword search)
+- Hybrid retrieval using ChromaDB (vector search) + BM25 (keyword search), scoped to one project
 - Grounded answer generation from retrieved documents only
 - Source citation showing which documents were used
-- Simple Streamlit frontend for interactive Q&A
 
 ## Tech stack
 
@@ -36,27 +43,73 @@ RAG_Chatbot/
 │   ├── requirements_2.txt     # current dependencies (use this one)
 │   ├── requirements.txt       # legacy pins, superseded by requirements_2.txt
 │   ├── __init__.py
-│   ├── data/                  # uploaded PDFs
+│   ├── data/                  # one folder per project, holding its PDFs
 │   ├── chroma_db/             # persisted vector store
 │   └── src/
 │       ├── config.py          # all application settings
-│       ├── ingest.py          # PDF extraction, chunking, indexing
-│       ├── retrieval.py       # hybrid dense + BM25 retrieval
+│       ├── projects.py        # project folders, name and filename validation
+│       ├── ingest.py          # PDF extraction, chunking, indexing, deletion
+│       ├── retrieval.py       # project-scoped hybrid dense + BM25 retrieval
 │       ├── llm_client.py      # Ollama HTTP client
 │       └── __init__.py
 ├── frontend/
-│   └── streamlit_app.py
+│   ├── streamlit_app.py       # entry point: sidebar navigation
+│   ├── api_client.py          # backend HTTP calls
+│   ├── ui.py                  # shared CSS and presentational helpers
+│   ├── .streamlit/config.toml # theme, headless start, telemetry opt-out
+│   └── views/
+│       ├── chat.py            # Chat page
+│       └── projects.py        # Projects page
+├── .pids/                     # PID files written by app.sh (not tracked)
 └── logs/                      # runtime logs (not tracked)
 ```
+
+## Projects
+
+A project is a folder under `backend/data/`, and every chunk is stored with a
+`project` field in its ChromaDB metadata:
+
+```text
+backend/data/
+├── Project 1/          doc1.pdf  doc2.pdf  doc3.pdf
+└── Project 2/          doc4.pdf  doc5.pdf
+```
+
+Selecting "Project 1" in the chat searches `doc1`–`doc3` and nothing else. The
+scoping is enforced on both retrieval paths: the dense search passes
+`where={"project": ...}` to ChromaDB, and BM25 indexes are built per project
+rather than over the whole corpus, so one project's vocabulary cannot skew
+another's term statistics.
+
+The Projects page is laid out like a file explorer: a grid of project folders,
+which open into the documents they contain.
+
+Uploading and ingesting are separate steps. An uploaded PDF sits in the project
+as "Not ingested" until you index it, either from a document's `⋯` menu or with
+the "Ingest pending" button.
+
+Project names are 1-64 characters, must start with a letter or digit, and accept
+only letters, digits, spaces, hyphens and underscores. Upload filenames are
+reduced to a bare `.pdf` leaf name, so neither can escape `backend/data/`.
 
 ## API endpoints
 
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/health` | Service health check |
-| POST | `/ingest` | Index PDFs from a server-side folder |
-| POST | `/ingest-files` | Upload and index PDFs |
-| POST | `/query` | Ask a question; returns `answer` and `sources` |
+| GET | `/projects` | List projects with document and chunk counts |
+| POST | `/projects` | Create a project (`{"name": ...}`) |
+| DELETE | `/projects/{project}` | Delete a project, its PDFs and its chunks |
+| GET | `/projects/{project}/documents` | List documents with index status |
+| POST | `/projects/{project}/documents` | Upload PDFs into a project (no indexing) |
+| POST | `/projects/{project}/ingest` | Index the project, or one `?filename=` |
+| DELETE | `/projects/{project}/documents?filename=` | Delete a PDF and its chunks |
+| POST | `/query` | Ask a question (`{"question": ..., "project": ...}`) |
+
+`project` on `/query` is optional. Omit it (or send `null`) for **general chat**:
+the question goes straight to the model with no retrieval and no document
+context, and the response carries `grounded: false` with an empty `sources` list.
+With a project, the response carries `grounded: true`.
 
 Interactive docs are served at `http://127.0.0.1:8000/docs`.
 
@@ -102,11 +155,14 @@ cd frontend
 streamlit run streamlit_app.py
 ```
 
-6. Open `http://127.0.0.1:8501`, upload one or more PDFs in the sidebar, click
-   "Ingest PDF docs", then ask questions in the chat box.
+6. Open `http://127.0.0.1:8501`. On the **Projects** page, create a project,
+   upload PDFs into it and click "Ingest pending". Then switch to **Chat**, pick
+   that project in the selector beside the message box and ask your questions.
+   Leaving the selector on "General chat" asks the model directly instead.
 
-The first ingestion downloads the embedding model (~80 MB) to `~/.cache/chroma`
-and can take a few minutes. Later runs reuse the cached model.
+The first ingestion downloads the embedding model (~80 MB) to `~/.cache/chroma`,
+which occupies roughly 170 MB once unpacked, and can take a few minutes. Later
+runs reuse the cached model.
 
 ## Configuration
 
@@ -120,15 +176,20 @@ values directly and restart the backend.
 | `DEFAULT_MODEL` | `llama3.2` | Ollama model used for generation |
 | `MAX_CONTEXT_CHUNKS` | `5` | Chunks retrieved per query |
 | `COLLECTION_NAME` | `document_collection` | ChromaDB collection name |
-| `DATA_DIR` | `backend/data` | Where uploaded PDFs are stored |
+| `DATA_DIR` | `backend/data` | Root folder holding the project folders |
 | `CHROMA_DIR` | `backend/chroma_db` | Where the vector store is persisted |
 
 ## Notes
 
-- Upload documents via the browser UI or place them in `backend/data/`
-- The chatbot only answers from the provided documents
-- Sources show the filenames of the documents used to generate each answer
-- Uploaded PDFs are re-indexed on every backend start; already-indexed chunks are skipped
+- Upload documents via the browser UI, or create a folder under `backend/data/`
+  and put PDFs in it
+- With a project selected, the chatbot answers only from that project's documents;
+  with "General chat" selected it answers from the model's own knowledge and cites
+  no sources
+- Sources show the titles of the documents used to generate each answer
+- Every project is re-indexed on backend start; already-indexed chunks are skipped
+- A PDF placed directly in `backend/data/` rather than inside a project folder is
+  ignored, since every query is project-scoped
 
 ### Suppressing telemetry warnings
 
@@ -181,7 +242,12 @@ The script writes PID files to `./.pids/` and logs to `./logs/`.
 ## Example retrieval flow
 
 1. PDFs are read and chunked
-2. Chunks are embedded and stored in ChromaDB
-3. BM25 is built from the same chunks
-4. Query is answered by hybrid retrieval
-5. The LLM is prompted with retrieved context only
+2. Chunks are embedded and stored in ChromaDB, tagged with their project
+3. On the first query for a project, a BM25 index is built from that project's
+   chunks and cached until the collection changes
+4. The query is answered by hybrid retrieval (dense + BM25, fused with
+   Reciprocal Rank Fusion), filtered to the selected project
+5. The LLM is prompted with the retrieved context only
+
+General chat skips steps 3-5 entirely: the question goes straight to the model
+with no context attached.
