@@ -57,24 +57,43 @@ class HybridRetriever:
         self.documents: List[str] = []
         self.metadatas: List[Dict[str, Any]] = []
         self.bm25 = None
+        # Chunk count the in-memory BM25 index was last built from. None forces a
+        # build on first use.
+        self._indexed_count: int | None = None
 
     def _load_index_state(self) -> None:
+        """Reload the corpus from Chroma and rebuild the BM25 index unconditionally."""
         if self.collection is None:
             return
         collection_data = self.collection.get(include=["documents", "metadatas"])
         self.documents = collection_data.get("documents", [])
         self.metadatas = collection_data.get("metadatas", [])
+        self._indexed_count = len(self.documents)
         if not self.documents:
             self.bm25 = None
             return
         tokenized_docs = [re.findall(r"\w+", doc.lower()) for doc in self.documents]
         self.bm25 = BM25Okapi(tokenized_docs)
 
+    def _ensure_index_state(self) -> None:
+        """Rebuild the BM25 index only when the collection size changed.
+
+        Reading the whole collection and rebuilding BM25 costs O(corpus), so doing it
+        per query would make every request scale with the total document count.
+        collection.count() is a cheap COUNT query, which keeps the common path O(1).
+        Callers that mutate the collection should invoke _load_index_state() directly
+        to force a rebuild.
+        """
+        if self.collection is None:
+            return
+        if self._indexed_count != self.collection.count():
+            self._load_index_state()
+
     def retrieve(self, query: str, top_k: int = MAX_CONTEXT_CHUNKS) -> List[Dict[str, Any]]:
         if self.collection is None:
             return []
 
-        self._load_index_state()
+        self._ensure_index_state()
         if not self.documents:
             return []
 
