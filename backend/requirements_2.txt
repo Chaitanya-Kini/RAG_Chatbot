@@ -1,0 +1,33 @@
+# Actual dependencies in use, pinned to the versions installed and verified in .venv
+# (Python 3.13.6). Direct imports only -- transitive dependencies are resolved by pip.
+#
+# Install (run from the repository root):
+#   python -m venv .venv
+#   .\.venv\Scripts\Activate.ps1        # PowerShell
+#   pip install -r backend/requirements_2.txt
+#
+# Deliberately NOT included:
+#   sentence-transformers / torch -- embeddings come from ChromaDB's built-in ONNX
+#   MiniLM-L6-v2 function instead, which needs no PyTorch (~15 MB vs ~2.5 GB) and
+#   guarantees documents and queries are embedded by the same model.
+
+# --- Backend API ---
+fastapi==0.141.1              # app.py -- ASGI app and routing
+uvicorn[standard]==0.52.3     # ASGI server; [standard] provides watchfiles for --reload
+pydantic==2.13.4              # app.py -- QueryRequest / QueryResponse models
+python-multipart==0.0.32      # required by /ingest-files for UploadFile form parsing
+                              # (an optional fastapi extra, so it must be pinned here)
+
+# --- Retrieval and indexing ---
+chromadb==1.5.9               # ingest.py, retrieval.py -- persistent vector store
+onnxruntime==1.28.0           # backs chromadb's DefaultEmbeddingFunction (all-MiniLM-L6-v2)
+langchain-text-splitters==1.1.2  # ingest.py -- RecursiveCharacterTextSplitter
+rank-bm25==0.2.2              # retrieval.py -- BM25Okapi sparse scoring
+pymupdf==1.28.2               # ingest.py -- PDF text extraction
+
+# --- LLM client and frontend ---
+requests==2.34.2              # llm_client.py (Ollama HTTP) and streamlit_app.py
+streamlit==1.61.1             # frontend/streamlit_app.py
+
+# --- Configuration ---
+python-dotenv==1.2.3          # config.py -- loads .env

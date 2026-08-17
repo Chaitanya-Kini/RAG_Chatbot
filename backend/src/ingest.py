@@ -4,17 +4,18 @@ from typing import Any, Dict, List
 
 import fitz
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from sentence_transformers import SentenceTransformer
 
 try:
-    from .config import CHROMA_DIR, COLLECTION_NAME, DATA_DIR, EMBEDDING_MODEL
+    from .config import CHROMA_DIR, COLLECTION_NAME, DATA_DIR
 except ImportError:  # pragma: no cover
-    from config import CHROMA_DIR, COLLECTION_NAME, DATA_DIR, EMBEDDING_MODEL
+    from config import CHROMA_DIR, COLLECTION_NAME, DATA_DIR
 
 try:
     import chromadb
+    from chromadb.utils import embedding_functions
 except ImportError:  # pragma: no cover
     chromadb = None
+    embedding_functions = None
 
 
 def extract_pdf_text(pdf_path: str | Path) -> str:
@@ -34,10 +35,17 @@ def sanitize_document_name(path: Path) -> str:
 
 class DocumentIndexer:
     def __init__(self):
-        self.embedding_model = SentenceTransformer(EMBEDDING_MODEL)
+        # ONNX MiniLM-L6-v2, the same embedder the retriever uses. Chroma embeds
+        # documents on add() and queries on query(), so both sides stay compatible.
+        self.embedding_function = (
+            embedding_functions.DefaultEmbeddingFunction() if embedding_functions else None
+        )
         self.client = chromadb.PersistentClient(path=str(CHROMA_DIR)) if chromadb else None
         self.collection = (
-            self.client.get_or_create_collection(name=COLLECTION_NAME)
+            self.client.get_or_create_collection(
+                name=COLLECTION_NAME,
+                embedding_function=self.embedding_function,
+            )
             if self.client is not None
             else None
         )
@@ -94,10 +102,11 @@ class DocumentIndexer:
         ids = [chunk["id"] for chunk in all_chunks]
         metadatas = [chunk["metadata"] for chunk in all_chunks]
 
-        # Check for already-existing ids in the collection and skip them to avoid duplicate adds
+        # Check for already-existing ids in the collection and skip them to avoid duplicate adds.
+        # Note: ids are always returned by get(); passing them via include= is rejected by Chroma.
         try:
-            existing_state = self.collection.get(include=["ids"]) or {}
-            existing_ids = set(existing_state.get("ids", []))
+            existing_state = self.collection.get(include=[]) or {}
+            existing_ids = set(existing_state.get("ids") or [])
         except Exception:
             existing_ids = set()
 
@@ -118,13 +127,12 @@ class DocumentIndexer:
             self.metadatas = [c["metadata"] for c in all_chunks]
             return 0
 
-        embeddings = self.embedding_model.encode(new_texts, convert_to_numpy=True, normalize_embeddings=True).tolist()
-
+        # No explicit embeddings= : Chroma embeds the documents with the collection's
+        # embedding function, which is the same one used for queries.
         self.collection.add(
             ids=new_ids,
             documents=new_texts,
             metadatas=new_metadatas,
-            embeddings=embeddings,
         )
 
         # Update cached lists (note: this caches only the most recently indexed batch)

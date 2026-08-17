@@ -2,25 +2,33 @@ import re
 from typing import Any, Dict, List
 
 from rank_bm25 import BM25Okapi
-from sentence_transformers import SentenceTransformer
 
 try:
-    from .config import CHROMA_DIR, COLLECTION_NAME, EMBEDDING_MODEL, MAX_CONTEXT_CHUNKS
+    from .config import CHROMA_DIR, COLLECTION_NAME, MAX_CONTEXT_CHUNKS
 except ImportError:  # pragma: no cover
-    from config import CHROMA_DIR, COLLECTION_NAME, EMBEDDING_MODEL, MAX_CONTEXT_CHUNKS
+    from config import CHROMA_DIR, COLLECTION_NAME, MAX_CONTEXT_CHUNKS
 
 try:
     import chromadb
+    from chromadb.utils import embedding_functions
 except ImportError:  # pragma: no cover
     chromadb = None
+    embedding_functions = None
 
 
 class HybridRetriever:
     def __init__(self):
-        self.embedding_model = SentenceTransformer(EMBEDDING_MODEL)
+        # Must match the indexer's embedding function, or query vectors and
+        # document vectors would not live in the same space.
+        self.embedding_function = (
+            embedding_functions.DefaultEmbeddingFunction() if embedding_functions else None
+        )
         self.client = chromadb.PersistentClient(path=str(CHROMA_DIR)) if chromadb else None
         self.collection = (
-            self.client.get_or_create_collection(name=COLLECTION_NAME)
+            self.client.get_or_create_collection(
+                name=COLLECTION_NAME,
+                embedding_function=self.embedding_function,
+            )
             if self.client is not None
             else None
         )

@@ -15,12 +15,10 @@ for logger_name in (
 from pydantic import BaseModel
 
 try:
-    from .src.eval import evaluate_answer_relevancy, evaluate_groundedness
     from .src.ingest import DocumentIndexer
     from .src.llm_client import OllamaClient
     from .src.retrieval import HybridRetriever
 except ImportError:  # pragma: no cover
-    from src.eval import evaluate_answer_relevancy, evaluate_groundedness
     from src.ingest import DocumentIndexer
     from src.llm_client import OllamaClient
     from src.retrieval import HybridRetriever
@@ -39,7 +37,6 @@ class QueryRequest(BaseModel):
 class QueryResponse(BaseModel):
     answer: str
     sources: list[str]
-    eval: dict
 
 
 @app.get("/health")
@@ -116,11 +113,7 @@ Answer:
                 seen.add(s)
                 sources.append(s)
 
-    eval_report = {
-        "groundedness": evaluate_groundedness(answer, sources),
-        "relevance": evaluate_answer_relevancy(payload.question, answer),
-    }
-    return QueryResponse(answer=answer, sources=sources, eval=eval_report)
+    return QueryResponse(answer=answer, sources=sources)
 
 
 @app.on_event("startup")
