@@ -41,7 +41,7 @@ class QueryResponse(BaseModel):
 
 @app.get("/health")
 def health_check() -> dict:
-    return {"status": "ok", "message": "3GPP RAG Chatbot is running"}
+    return {"status": "ok", "message": "RAG Chatbot is running"}
 
 
 @app.post("/ingest")

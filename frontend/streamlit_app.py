@@ -45,7 +45,7 @@ if st.sidebar.button("Ingest PDF docs"):
         except Exception as exc:
             st.sidebar.error(f"Ingestion failed: {exc}")
 
-question = st.chat_input("Ask a 3GPP telecom question...")
+question = st.chat_input("Ask a question about your documents...")
 if question:
     with st.chat_message("user"):
         st.markdown(question)

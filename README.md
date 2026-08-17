@@ -35,12 +35,11 @@ RAG_Chatbot/
 │   ├── start_backend.ps1      # PowerShell backend launcher
 │   ├── requirements_2.txt     # current dependencies (use this one)
 │   ├── requirements.txt       # legacy pins, superseded by requirements_2.txt
-│   ├── .env.example
 │   ├── __init__.py
 │   ├── data/                  # uploaded PDFs
 │   ├── chroma_db/             # persisted vector store
 │   └── src/
-│       ├── config.py          # env-driven settings
+│       ├── config.py          # all application settings
 │       ├── ingest.py          # PDF extraction, chunking, indexing
 │       ├── retrieval.py       # hybrid dense + BM25 retrieval
 │       ├── llm_client.py      # Ollama HTTP client
@@ -111,10 +110,11 @@ and can take a few minutes. Later runs reuse the cached model.
 
 ## Configuration
 
-Settings are read from the environment, with a `.env` file in `backend/` picked up
-automatically. Copy `backend/.env.example` to `backend/.env` to override defaults.
+All settings live in [`backend/src/config.py`](backend/src/config.py) as plain
+constants. The project holds no secrets, so there is no `.env` file — edit the
+values directly and restart the backend.
 
-| Variable | Default | Purpose |
+| Setting | Default | Purpose |
 | --- | --- | --- |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama server address |
 | `DEFAULT_MODEL` | `llama3.2` | Ollama model used for generation |

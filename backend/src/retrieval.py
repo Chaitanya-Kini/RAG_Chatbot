@@ -15,6 +15,28 @@ except ImportError:  # pragma: no cover
     chromadb = None
     embedding_functions = None
 
+# Reciprocal Rank Fusion constant. 60 is the value from the original RRF paper and
+# the usual default; larger values flatten the contribution of top ranks.
+RRF_K = 60
+
+# How many BM25 candidates to feed into fusion, as a multiple of top_k.
+SPARSE_CANDIDATE_FACTOR = 4
+
+
+def _hit_key(hit: Dict[str, Any]) -> str:
+    """Stable identity for a chunk, used to merge dense and sparse hits.
+
+    Prefer the indexer's (source, chunk_index) pair; fall back to the chunk text
+    when metadata is missing. Keying on str(metadata) would be fragile, since it
+    depends on dict ordering.
+    """
+    metadata = hit.get("metadata") or {}
+    source = metadata.get("source")
+    chunk_index = metadata.get("chunk_index")
+    if source is not None and chunk_index is not None:
+        return f"{source}#{chunk_index}"
+    return hit["text"]
+
 
 class HybridRetriever:
     def __init__(self):
@@ -67,7 +89,11 @@ class HybridRetriever:
         fetched_metadatas = dense_results.get("metadatas", [[]])[0]
         fetched_distances = dense_results.get("distances", [[]])[0]
         for document, metadata, distance in zip(fetched_documents, fetched_metadatas, fetched_distances):
-            score = max(0.0, 1.0 - float(distance)) if distance is not None else 0.5
+            # Chroma's default space is squared L2. The embedding function returns
+            # unit-normalised vectors, so squared L2 and cosine relate exactly as
+            # d = 2 * (1 - cos), giving cos = 1 - d / 2 over the range [-1, 1].
+            # The previous "1 - d" assumed cosine distance and clamped most hits to 0.
+            score = 1.0 - float(distance) / 2.0 if distance is not None else 0.0
             dense_hits.append({
                 "text": document,
                 "metadata": metadata or {},
@@ -78,77 +104,42 @@ class HybridRetriever:
         if self.bm25 is not None:
             query_tokens = re.findall(r"\w+", query.lower())
             scores = self.bm25.get_scores(query_tokens)
+            # Keep every candidate rather than dropping score <= 0. BM25 assigns
+            # negative IDF to terms that appear in most documents, so on a small
+            # corpus filtering by score would discard the entire sparse signal.
             for index, score in enumerate(scores):
-                if score <= 0:
-                    continue
                 sparse_hits.append({
                     "text": self.documents[index],
                     "metadata": self.metadatas[index] if index < len(self.metadatas) else {},
                     "score": float(score),
                 })
+            sparse_hits.sort(key=lambda item: item["score"], reverse=True)
+            del sparse_hits[top_k * SPARSE_CANDIDATE_FACTOR :]
 
+        # Reciprocal Rank Fusion. Dense similarity is bounded to [-1, 1] while BM25
+        # is unbounded, so summing the raw scores let BM25 dominate. Fusing on rank
+        # instead makes the two signals comparable without any tuning weights.
         combined: Dict[str, Dict[str, Any]] = {}
-        for hit in dense_hits:
-            key = hit["text"] + str(hit.get("metadata", {}))
-            combined[key] = {**hit, "score": hit["score"]}
-
-        for hit in sparse_hits:
-            key = hit["text"] + str(hit.get("metadata", {}))
-            if key in combined:
-                combined[key]["score"] += hit["score"] * 0.5
-            else:
-                combined[key] = {**hit, "score": hit["score"] * 0.6}
+        for hits in (dense_hits, sparse_hits):
+            ranked = sorted(hits, key=lambda item: item["score"], reverse=True)
+            for rank, hit in enumerate(ranked):
+                key = _hit_key(hit)
+                entry = combined.get(key)
+                if entry is None:
+                    entry = {
+                        "text": hit["text"],
+                        "metadata": hit.get("metadata") or {},
+                        "score": 0.0,
+                    }
+                    combined[key] = entry
+                entry["score"] += 1.0 / (RRF_K + rank + 1)
 
         ranked_hits = sorted(combined.values(), key=lambda item: item["score"], reverse=True)
 
-        # Deduplicate hits by source filename while preserving score ordering
-        seen_sources = set()
-        deduped_hits = []
-        for hit in ranked_hits:
-            src = hit.get("metadata", {}).get("source")
-            if not src:
-                # if no source metadata, include once under 'Unknown'
-                src = "Unknown"
-            if src in seen_sources:
-                continue
-            seen_sources.add(src)
-            deduped_hits.append(hit)
-
-        return deduped_hits[:top_k]
-
-    def answer(self, question: str, top_k: int = MAX_CONTEXT_CHUNKS) -> Dict[str, Any]:
-        hits = self.retrieve(question, top_k=top_k)
-        if not hits:
-            return {
-                "answer": "Information not found in 3GPP documentation.",
-                "sources": [],
-                "context": [],
-            }
-
-        context = "\n\n".join(
-            f"[{idx + 1}] {hit['text']}\nSource: {hit.get('metadata', {}).get('source', 'Unknown')}"
-            for idx, hit in enumerate(hits)
-        )
-
-        prompt = f"""You are a telecom specification assistant.
-Your job is to answer only from the provided 3GPP context.
-Do not use outside knowledge. If the answer is not supported by the context, reply exactly:
-Information not found in 3GPP documentation.
-
-Provide explicit source references using the document name and section if available.
-
-Context:
-{context}
-
-Question: {question}
-
-Answer:
-"""
-        return {
-            "answer": prompt,
-            "sources": [hit.get("metadata", {}).get("source", "Unknown") for hit in hits],
-            "context": [hit["text"] for hit in hits],
-        }
+        # Return the best chunks by relevance. Chunks are deliberately not deduplicated
+        # by source: several passages from one document are often needed to answer a
+        # question. The response's source list is deduplicated separately in app.py.
+        return ranked_hits[:top_k]
 
 
 if __name__ == "__main__":

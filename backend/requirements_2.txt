@@ -28,6 +28,3 @@ pymupdf==1.28.2               # ingest.py -- PDF text extraction
 # --- LLM client and frontend ---
 requests==2.34.2              # llm_client.py (Ollama HTTP) and streamlit_app.py
 streamlit==1.61.1             # frontend/streamlit_app.py
-
-# --- Configuration ---
-python-dotenv==1.2.3          # config.py -- loads .env
